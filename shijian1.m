@@ -21,6 +21,8 @@ else
 end
 
 normalizedSize = [160, 160];
+targetFaceOccupancy = 0.96;
+minimumVerifiedFaceOccupancy = 0.90;
 trainRatioValues = [0.80, 0.90, 0.92];
 splitSeedValues = [20260417:20260426, 20260438];
 varianceToKeep = 90;
@@ -213,13 +215,14 @@ for r = 1:size(landmarkMatrix, 1)
         faceHistEq = histeq(faceGray);
         faceOnlyCrop = cropAlignedFaceOnly(faceHistEq, alignedLandmarks68, normalizedSize);
         faceNormalized = imresize(faceOnlyCrop, normalizedSize);
+        faceNormalized = tightenFaceOccupancy(faceNormalized, faceDetector, normalizedSize, targetFaceOccupancy);
 
         saveName = sprintf('%s_MTCNN_68点预处理.jpg', saveStems(recId));
         savePath = fullfile(stImageSavePath, saveName);
         imwrite(faceNormalized, savePath);
 
         faceOnlyCheckCount = faceOnlyCheckCount + 1;
-        [faceOnlyOk, faceOnlyReason] = verifyPreprocessedFaceOnly(savePath, faceDetector);
+        [faceOnlyOk, faceOnlyReason] = verifyPreprocessedFaceOnly(savePath, faceDetector, minimumVerifiedFaceOccupancy);
         if ~faceOnlyOk
             failedNames(end + 1, 1) = sampleNames(recId); %#ok<SAGROW>
             failedReasons(end + 1, 1) = "预处理后人脸区域校验失败：" + faceOnlyReason; %#ok<SAGROW>
@@ -408,7 +411,36 @@ function faceOnlyCrop = cropAlignedFaceOnly(faceGray, alignedLandmarks68, normal
     end
 end
 
-function [ok, reason] = verifyPreprocessedFaceOnly(imagePath, faceDetector)
+function faceTight = tightenFaceOccupancy(faceImage, faceDetector, normalizedSize, targetFaceOccupancy)
+    faceTight = faceImage;
+    [bbox, ~] = detectFaceMTCNN(im2uint8(ensureRGB(faceImage)), faceDetector, [160, 240]);
+    if isempty(bbox)
+        return;
+    end
+
+    bbox = clipBboxToImage(bbox, normalizedSize);
+    if bbox(3) < 8 || bbox(4) < 8
+        return;
+    end
+
+    scale = sqrt(max(0.01, min(0.99, targetFaceOccupancy)));
+    cropW = max(1, bbox(3) / scale);
+    cropH = max(1, bbox(4) / scale);
+    centerX = bbox(1) + bbox(3) / 2;
+    centerY = bbox(2) + bbox(4) / 2;
+
+    x1 = max(1, centerX - cropW / 2);
+    y1 = max(1, centerY - cropH / 2);
+    x2 = min(normalizedSize(2), centerX + cropW / 2);
+    y2 = min(normalizedSize(1), centerY + cropH / 2);
+
+    crop = imcrop(faceImage, [x1, y1, max(1, x2 - x1), max(1, y2 - y1)]);
+    if ~isempty(crop)
+        faceTight = imresize(crop, normalizedSize);
+    end
+end
+
+function [ok, reason] = verifyPreprocessedFaceOnly(imagePath, faceDetector, minimumFaceOccupancy)
     ok = false;
     reason = "";
     if ~isfile(imagePath)
@@ -425,6 +457,7 @@ function [ok, reason] = verifyPreprocessedFaceOnly(imagePath, faceDetector)
 
     imgH = size(img, 1);
     imgW = size(img, 2);
+    bbox = clipBboxToImage(bbox, [imgH, imgW]);
     areaRatio = (bbox(3) * bbox(4)) / (imgW * imgH);
     widthRatio = bbox(3) / imgW;
     heightRatio = bbox(4) / imgH;
@@ -432,10 +465,18 @@ function [ok, reason] = verifyPreprocessedFaceOnly(imagePath, faceDetector)
     centerY = bbox(2) + bbox(4) / 2;
     centered = abs(centerX - imgW / 2) <= 0.25 * imgW && abs(centerY - imgH / 2) <= 0.25 * imgH;
 
-    ok = areaRatio >= 0.28 && widthRatio >= 0.45 && heightRatio >= 0.45 && centered;
+    ok = areaRatio >= minimumFaceOccupancy && widthRatio >= 0.85 && heightRatio >= 0.85 && centered;
     if ~ok
         reason = sprintf('人脸占比不足或未居中：area=%.2f, width=%.2f, height=%.2f', areaRatio, widthRatio, heightRatio);
     end
+end
+
+function bbox = clipBboxToImage(bbox, imageSize)
+    x1 = max(1, bbox(1));
+    y1 = max(1, bbox(2));
+    x2 = min(imageSize(2), bbox(1) + bbox(3));
+    y2 = min(imageSize(1), bbox(2) + bbox(4));
+    bbox = [x1, y1, max(1, x2 - x1), max(1, y2 - y1)];
 end
 
 function [bestResult, searchResults] = searchTrainTestPca(samples, labels, sampleNames, originalPaths, preprocessedPaths, trainRatioValues, seedValues, varianceToKeep)
