@@ -179,6 +179,8 @@ validNames = strings(0, 1);
 validOriginalPaths = strings(0, 1);
 validPreprocessedPaths = strings(0, 1);
 processedCount = 0;
+faceOnlyCheckCount = 0;
+faceOnlyPassCount = 0;
 
 for r = 1:size(landmarkMatrix, 1)
     recId = landmarkMatrix(r, 1);
@@ -205,19 +207,35 @@ for r = 1:size(landmarkMatrix, 1)
         tform = fitgeotrans(eyePts, targetEyePts, 'nonreflectivesimilarity');
         Rfixed = imref2d(normalizedSize);
         faceAligned = imwarp(img, tform, 'OutputView', Rfixed, 'FillValues', 0);
+        alignedLandmarks68 = transformPointsForward(tform, landmarks68);
 
         faceGray = im2uint8(toGray(faceAligned));
         faceHistEq = histeq(faceGray);
-        faceNormalized = imresize(faceHistEq, normalizedSize);
-
-        processedCount = processedCount + 1;
-        pcaSamples(processedCount, :) = extractRecognitionFeatures(faceNormalized); %#ok<SAGROW>
-        validLabels(processedCount, 1) = identityLabels(recId); 
-        validNames(processedCount, 1) = sampleNames(recId); 
+        faceOnlyCrop = cropAlignedFaceOnly(faceHistEq, alignedLandmarks68, normalizedSize);
+        faceNormalized = imresize(faceOnlyCrop, normalizedSize);
 
         saveName = sprintf('%s_MTCNN_68点预处理.jpg', saveStems(recId));
         savePath = fullfile(stImageSavePath, saveName);
         imwrite(faceNormalized, savePath);
+
+        faceOnlyCheckCount = faceOnlyCheckCount + 1;
+        [faceOnlyOk, faceOnlyReason] = verifyPreprocessedFaceOnly(savePath, faceDetector);
+        if ~faceOnlyOk
+            failedNames(end + 1, 1) = sampleNames(recId); %#ok<SAGROW>
+            failedReasons(end + 1, 1) = "预处理后人脸区域校验失败：" + faceOnlyReason; %#ok<SAGROW>
+            fprintf('图片 %s 预处理后人脸区域校验失败：%s\n', sampleNames(recId), faceOnlyReason);
+            if isfile(savePath)
+                delete(savePath);
+            end
+            continue;
+        end
+
+        processedCount = processedCount + 1;
+        faceOnlyPassCount = faceOnlyPassCount + 1;
+        pcaSamples(processedCount, :) = extractRecognitionFeatures(faceNormalized); %#ok<SAGROW>
+        validLabels(processedCount, 1) = identityLabels(recId); 
+        validNames(processedCount, 1) = sampleNames(recId); 
+
         validOriginalPaths(processedCount, 1) = fullPaths(recId);
         validPreprocessedPaths(processedCount, 1) = string(savePath);
         fprintf('已保存预处理图片：%s\n', saveName);
@@ -237,6 +255,7 @@ bestResult = [];
 searchResults = table();
 fprintf('\nMTCNN人脸检测成功率：%.2f%% (%d/%d)\n', mtcnnSuccessRate, mtcnnCount, totalImages);
 fprintf('68点预处理成功率：%.2f%% (%d/%d)\n', preprocessSuccessRate, processedCount, totalImages);
+fprintf('预处理后仅人脸区域校验通过率：%.2f%% (%d/%d)\n', 100 * faceOnlyPassCount / max(faceOnlyCheckCount, 1), faceOnlyPassCount, faceOnlyCheckCount);
 
 if processedCount < 3 || numel(unique(validLabels)) < 2
     warning('有效样本或类别数量不足，无法进行 PCA 识别成功率检测。');
@@ -356,6 +375,67 @@ end
 
 function featureVector = extractRecognitionFeatures(faceGray)
     featureVector = shijian_face_core('extractRecognitionFeatures', faceGray);
+end
+
+function faceOnlyCrop = cropAlignedFaceOnly(faceGray, alignedLandmarks68, normalizedSize)
+    validPts = alignedLandmarks68(all(isfinite(alignedLandmarks68), 2), :);
+    validPts = validPts(validPts(:, 1) >= 1 & validPts(:, 1) <= normalizedSize(2) & ...
+        validPts(:, 2) >= 1 & validPts(:, 2) <= normalizedSize(1), :);
+
+    if size(validPts, 1) < 20
+        faceOnlyCrop = faceGray;
+        return;
+    end
+
+    x1 = min(validPts(:, 1));
+    y1 = min(validPts(:, 2));
+    x2 = max(validPts(:, 1));
+    y2 = max(validPts(:, 2));
+    w = x2 - x1;
+    h = y2 - y1;
+
+    xPad = 0.18 * w;
+    topPad = 0.28 * h;
+    bottomPad = 0.18 * h;
+    x1 = max(1, floor(x1 - xPad));
+    y1 = max(1, floor(y1 - topPad));
+    x2 = min(normalizedSize(2), ceil(x2 + xPad));
+    y2 = min(normalizedSize(1), ceil(y2 + bottomPad));
+
+    faceOnlyCrop = imcrop(faceGray, [x1, y1, max(1, x2 - x1), max(1, y2 - y1)]);
+    if isempty(faceOnlyCrop)
+        faceOnlyCrop = faceGray;
+    end
+end
+
+function [ok, reason] = verifyPreprocessedFaceOnly(imagePath, faceDetector)
+    ok = false;
+    reason = "";
+    if ~isfile(imagePath)
+        reason = "预处理图片文件不存在";
+        return;
+    end
+
+    img = im2uint8(ensureRGB(imread(imagePath)));
+    [bbox, ~] = detectFaceMTCNN(img, faceDetector, [160, 240]);
+    if isempty(bbox)
+        reason = "MTCNN无法在预处理图片中重新检测到人脸";
+        return;
+    end
+
+    imgH = size(img, 1);
+    imgW = size(img, 2);
+    areaRatio = (bbox(3) * bbox(4)) / (imgW * imgH);
+    widthRatio = bbox(3) / imgW;
+    heightRatio = bbox(4) / imgH;
+    centerX = bbox(1) + bbox(3) / 2;
+    centerY = bbox(2) + bbox(4) / 2;
+    centered = abs(centerX - imgW / 2) <= 0.25 * imgW && abs(centerY - imgH / 2) <= 0.25 * imgH;
+
+    ok = areaRatio >= 0.28 && widthRatio >= 0.45 && heightRatio >= 0.45 && centered;
+    if ~ok
+        reason = sprintf('人脸占比不足或未居中：area=%.2f, width=%.2f, height=%.2f', areaRatio, widthRatio, heightRatio);
+    end
 end
 
 function [bestResult, searchResults] = searchTrainTestPca(samples, labels, sampleNames, originalPaths, preprocessedPaths, trainRatioValues, seedValues, varianceToKeep)
