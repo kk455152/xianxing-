@@ -1,8 +1,9 @@
-%% 线性代数课程项目：MTCNN + 68关键点预处理 + PCA识别评估
-% 流程：MTCNN人脸检测 -> PFLD 68关键点检测 -> 特征点配齐 -> 直方图均衡化 -> 尺度归一化 -> PCA识别
-% 输出：只保存完成预处理后的标准化人脸，不再生成修改前/修改后的拼接对比图。
+%% 线性代数课程项目：快速人脸预处理 + PCA识别评估
+% 流程：OpenCV/Viola-Jones级联检测 -> 肤色区域兜底 -> 人脸紧裁剪 -> 直方图均衡化 -> 尺度归一化 -> PCA识别
+% 说明：本脚本已停用 MTCNN 和批量68点候选推理，目标是在保证人脸区域占比的同时缩短运行时间。
 
 clear; clc;
+scriptTimer = tic;
 scriptDir = fileparts(mfilename('fullpath'));
 addpath(scriptDir);
 
@@ -26,68 +27,43 @@ minimumVerifiedFaceOccupancy = 0.95;
 trainRatioValues = [0.80, 0.90, 0.92];
 splitSeedValues = [20260417:20260426, 20260438];
 varianceToKeep = 90;
-maxDetectionSides = [900, 1300];
-
-pythonExe = 'C:\Users\32545\AppData\Local\Python\pythoncore-3.14-64\python.exe';
-landmarkModelPath = 'C:\Users\32545\Documents\MATLAB\face-landmark-68\landmarks_68_pfld.onnx';
 resultMatPath = fullfile(scriptDir, 'shijian_last_result.mat');
 if isfile(resultMatPath)
     delete(resultMatPath);
 end
 
-if exist('mtcnn.Detector', 'class') ~= 8
-    error('未找到 MTCNN Face Detection。请先确认 mtcnn.Detector 已加入 MATLAB 路径。');
-end
-if ~isfile(pythonExe)
-    error('未找到 Python：%s', pythonExe);
-end
-if ~isfile(landmarkModelPath)
-    error('未找到 68关键点 ONNX 模型：%s', landmarkModelPath);
-end
-
-% 目标眼点位置，用 68点中的双眼中心进行相似变换配齐。
-targetEyePts = [0.34 * normalizedSize(2), 0.38 * normalizedSize(1); ...
-                0.66 * normalizedSize(2), 0.38 * normalizedSize(1)];
-
-disp('正在加载 MTCNN 人脸检测器...');
-faceDetector = mtcnn.Detector('MinSize', 20, 'ConfidenceThresholds', [0.55, 0.65, 0.75]);
-
 % =========================================================================
-% 2. 文件列表与临时目录
+% 2. 文件列表
 % =========================================================================
 disp('正在检索照片...');
 allFiles = dir(fullfile(stImageFilePath, '**', '*.*'));
 allFiles = allFiles(~[allFiles.isdir]);
 allFiles = allFiles(arrayfun(@(f) any(strcmpi(filepartsExt(f.name), supportedExts)), allFiles));
 
-tempRoot = fullfile(tempdir, ['mtcnn_68_landmarks_', char(java.util.UUID.randomUUID)]);
-cropDir = fullfile(tempRoot, 'crops');
-mkdir(cropDir);
-cleanupObj = onCleanup(@() cleanupTempFolder(tempRoot));
-
-manifestPath = fullfile(tempRoot, 'manifest.csv');
-landmarkCsvPath = fullfile(tempRoot, 'landmarks68.csv');
-helperPath = fullfile(tempRoot, 'detect68_landmarks.py');
-writePythonHelper(helperPath);
-
-% =========================================================================
-% 3. 第一阶段：MTCNN检测人脸，并保存临时裁剪给68点模型
-% =========================================================================
 subfolderCounts = containers.Map('KeyType', 'char', 'ValueType', 'int32');
 processedPaths = containers.Map('KeyType', 'char', 'ValueType', 'logical');
 
-fullPaths = strings(0, 1);
-saveStems = strings(0, 1);
-identityLabels = strings(0, 1);
-sampleNames = strings(0, 1);
-cropBoxes = zeros(0, 4);
-faceScores = zeros(0, 1);
+pcaSamples = [];
+validLabels = strings(0, 1);
+validNames = strings(0, 1);
+validOriginalPaths = strings(0, 1);
+validPreprocessedPaths = strings(0, 1);
+validFaceOccupancies = zeros(0, 1);
+validPreprocessMethods = strings(0, 1);
 failedNames = strings(0, 1);
 failedReasons = strings(0, 1);
 
 totalImages = 0;
+imageCount = 0;
+processedCount = 0;
+faceOnlyCheckCount = 0;
+faceOnlyPassCount = 0;
 mtcnnCount = 0;
+mtcnnSuccessRate = 0;
 
+% =========================================================================
+% 3. 快速预处理：级联检测 + 肤色兜底 + 尺度归一化
+% =========================================================================
 for k = 1:length(allFiles)
     [~, fileName, ext] = fileparts(allFiles(k).name);
     if ~any(strcmpi(ext, supportedExts)) || contains(fileName, '基准照片')
@@ -103,23 +79,6 @@ for k = 1:length(allFiles)
 
     try
         img = im2uint8(ensureRGB(readImageUpright(fullPath)));
-        [faceBbox, faceScore] = detectFaceMTCNN(img, faceDetector, maxDetectionSides);
-        if isempty(faceBbox)
-            failedNames(end + 1, 1) = string(allFiles(k).name); %#ok<SAGROW>
-            failedReasons(end + 1, 1) = "MTCNN未检测到人脸"; %#ok<SAGROW>
-            fprintf('图片 %s：MTCNN未检测到人脸，跳过。\n', fileName);
-            continue;
-        end
-
-        cropBox = expandAndClipBbox(faceBbox, 0.15, size(img));
-        faceCrop = imcrop(img, cropBox);
-        if isempty(faceCrop)
-            failedNames(end + 1, 1) = string(allFiles(k).name); %#ok<SAGROW>
-            failedReasons(end + 1, 1) = "人脸裁剪为空"; %#ok<SAGROW>
-            fprintf('图片 %s：人脸裁剪为空，跳过。\n', fileName);
-            continue;
-        end
-
         [saveStem, identityName] = getFolderNames(fullPath, stImageFilePath);
         if isKey(subfolderCounts, saveStem)
             subfolderCounts(saveStem) = subfolderCounts(saveStem) + 1;
@@ -127,106 +86,20 @@ for k = 1:length(allFiles)
             subfolderCounts(saveStem) = 1;
         end
 
-        mtcnnCount = mtcnnCount + 1;
-        cropPath = fullfile(cropDir, sprintf('face_%06d.png', mtcnnCount));
-        imwrite(faceCrop, cropPath);
+        imageCount = imageCount + 1;
+        sampleName = string(allFiles(k).name);
+        saveStemWithIndex = string(sprintf('%s_%d', saveStem, subfolderCounts(saveStem)));
 
-        fullPaths(mtcnnCount, 1) = string(fullPath); 
-        saveStems(mtcnnCount, 1) = string(sprintf('%s_%d', saveStem, subfolderCounts(saveStem))); 
-        identityLabels(mtcnnCount, 1) = string(identityName); 
-        sampleNames(mtcnnCount, 1) = string(allFiles(k).name); %#ok<SAGROW>
-        cropBoxes(mtcnnCount, :) = cropBox; 
-        faceScores(mtcnnCount, 1) = faceScore; %#ok<SAGROW>
-
-        fprintf('MTCNN检测成功：%s\n', fileName);
-    catch ME
-        failedNames(end + 1, 1) = string(allFiles(k).name); %#ok<SAGROW>
-        failedReasons(end + 1, 1) = string(ME.message); %#ok<SAGROW>
-        fprintf('图片 %s 检测失败：%s\n', fileName, ME.message);
-    end
-end
-
-if mtcnnCount == 0
-    error('没有任何图片通过 MTCNN 人脸检测，无法继续做68关键点与PCA识别。');
-end
-
-manifest = table((1:mtcnnCount)', strings(mtcnnCount, 1), cropBoxes(:, 1), cropBoxes(:, 2), cropBoxes(:, 3), cropBoxes(:, 4), ...
-    'VariableNames', {'id', 'cropPath', 'boxX', 'boxY', 'boxW', 'boxH'});
-for i = 1:mtcnnCount
-    manifest.cropPath(i) = string(fullfile(cropDir, sprintf('face_%06d.png', i)));
-end
-writetable(manifest, manifestPath, 'Encoding', 'UTF-8');
-
-% =========================================================================
-
-% =========================================================================
-disp('正在使用 PFLD ONNX 模型检测68个关键点...');
-cmd = sprintf('"%s" "%s" "%s" "%s" "%s"', pythonExe, helperPath, landmarkModelPath, manifestPath, landmarkCsvPath);
-[status, cmdout] = system(cmd);
-if status ~= 0
-    error('68关键点检测失败：\n%s', cmdout);
-end
-
-landmarkMatrix = readmatrix(landmarkCsvPath, 'NumHeaderLines', 1);
-if isempty(landmarkMatrix)
-    error('68关键点检测没有返回任何结果。');
-end
-
-% =========================================================================
-% 5. 第三阶段：用68点配齐、直方图均衡化、尺度归一化，并保存预处理图片
-% =========================================================================
-pcaSamples = [];
-validLabels = strings(0, 1);
-validNames = strings(0, 1);
-validOriginalPaths = strings(0, 1);
-validPreprocessedPaths = strings(0, 1);
-validFaceOccupancies = zeros(0, 1);
-processedCount = 0;
-faceOnlyCheckCount = 0;
-faceOnlyPassCount = 0;
-
-for r = 1:size(landmarkMatrix, 1)
-    recId = landmarkMatrix(r, 1);
-    if recId < 1 || recId > mtcnnCount || size(landmarkMatrix, 2) < 137
-        continue;
-    end
-
-    try
-        landmarks68 = reshape(landmarkMatrix(r, 2:137), 2, 68)';
-        if any(~isfinite(landmarks68(:)))
-            failedNames(end + 1, 1) = sampleNames(recId); %#ok<SAGROW>
-            failedReasons(end + 1, 1) = "68关键点包含无效数值"; %#ok<SAGROW>
-            continue;
-        end
-
-        eyePts = eyeCentersFrom68(landmarks68);
-        if isempty(eyePts)
-            failedNames(end + 1, 1) = sampleNames(recId); %#ok<SAGROW>
-            failedReasons(end + 1, 1) = "68关键点未能形成有效双眼中心"; %#ok<SAGROW>
-            continue;
-        end
-
-        img = im2uint8(ensureRGB(imread(fullfile(cropDir, sprintf('face_%06d.png', recId)))));
-        tform = fitgeotrans(eyePts, targetEyePts, 'nonreflectivesimilarity');
-        Rfixed = imref2d(normalizedSize);
-        faceAligned = imwarp(img, tform, 'OutputView', Rfixed, 'FillValues', 0);
-        alignedLandmarks68 = transformPointsForward(tform, landmarks68);
-
-        faceGray = im2uint8(toGray(faceAligned));
-        faceHistEq = histeq(faceGray);
-        [faceOnlyCrop, faceCropMeta] = cropAlignedFaceOnly(faceHistEq, alignedLandmarks68, normalizedSize, targetFaceOccupancy);
-        faceNormalized = imresize(faceOnlyCrop, normalizedSize);
-
-        saveName = sprintf('%s_MTCNN_68点预处理.jpg', saveStems(recId));
+        [faceNormalized, faceCropMeta, preprocessMethod] = fastFacePreprocess(img, normalizedSize, targetFaceOccupancy);
+        saveName = sprintf('%s_fast_face.jpg', saveStemWithIndex);
         savePath = fullfile(stImageSavePath, saveName);
         imwrite(faceNormalized, savePath);
 
         faceOnlyCheckCount = faceOnlyCheckCount + 1;
         [faceOnlyOk, faceOnlyReason, faceOccupancy] = verifyPreprocessedFaceOnly(savePath, faceCropMeta, minimumVerifiedFaceOccupancy);
         if ~faceOnlyOk
-            failedNames(end + 1, 1) = sampleNames(recId); %#ok<SAGROW>
+            failedNames(end + 1, 1) = sampleName; %#ok<SAGROW>
             failedReasons(end + 1, 1) = "预处理后人脸区域校验失败：" + faceOnlyReason; %#ok<SAGROW>
-            fprintf('图片 %s 预处理后人脸区域校验失败：%s\n', sampleNames(recId), faceOnlyReason);
             if isfile(savePath)
                 delete(savePath);
             end
@@ -236,29 +109,30 @@ for r = 1:size(landmarkMatrix, 1)
         processedCount = processedCount + 1;
         faceOnlyPassCount = faceOnlyPassCount + 1;
         pcaSamples(processedCount, :) = extractRecognitionFeatures(faceNormalized); %#ok<SAGROW>
-        validLabels(processedCount, 1) = identityLabels(recId); 
-        validNames(processedCount, 1) = sampleNames(recId); 
-
-        validOriginalPaths(processedCount, 1) = fullPaths(recId);
+        validLabels(processedCount, 1) = string(identityName);
+        validNames(processedCount, 1) = sampleName;
+        validOriginalPaths(processedCount, 1) = string(fullPath);
         validPreprocessedPaths(processedCount, 1) = string(savePath);
         validFaceOccupancies(processedCount, 1) = faceOccupancy;
-        fprintf('已保存预处理图片：%s\n', saveName);
+        validPreprocessMethods(processedCount, 1) = preprocessMethod;
+        fprintf('已保存预处理图片：%s，方法：%s，占比：%.2f%%\n', saveName, preprocessMethod, 100 * faceOccupancy);
     catch ME
-        failedNames(end + 1, 1) = sampleNames(recId); %#ok<SAGROW>
+        failedNames(end + 1, 1) = string(allFiles(k).name); %#ok<SAGROW>
         failedReasons(end + 1, 1) = string(ME.message); %#ok<SAGROW>
-        fprintf('图片 %s 预处理失败：%s\n', sampleNames(recId), ME.message);
+        fprintf('图片 %s 预处理失败：%s\n', fileName, ME.message);
     end
 end
 
 % =========================================================================
-% 6. PCA 降维与识别成功率检测
+% 4. PCA 降维与识别成功率检测
 % =========================================================================
-mtcnnSuccessRate = 100 * mtcnnCount / max(totalImages, 1);
+preprocessCoverageRate = 100 * imageCount / max(totalImages, 1);
 preprocessSuccessRate = 100 * processedCount / max(totalImages, 1);
 bestResult = [];
 searchResults = table();
-fprintf('\nMTCNN人脸检测成功率：%.2f%% (%d/%d)\n', mtcnnSuccessRate, mtcnnCount, totalImages);
-fprintf('68点预处理成功率：%.2f%% (%d/%d)\n', preprocessSuccessRate, processedCount, totalImages);
+fprintf('\nMTCNN人脸检测：已停用\n');
+fprintf('快速预处理覆盖率：%.2f%% (%d/%d)\n', preprocessCoverageRate, imageCount, totalImages);
+fprintf('快速人脸预处理成功率：%.2f%% (%d/%d)\n', preprocessSuccessRate, processedCount, totalImages);
 fprintf('预处理后仅人脸区域校验通过率：%.2f%% (%d/%d)\n', 100 * faceOnlyPassCount / max(faceOnlyCheckCount, 1), faceOnlyPassCount, faceOnlyCheckCount);
 
 if processedCount < 3 || numel(unique(validLabels)) < 2
@@ -271,25 +145,27 @@ else
         bestResult.accuracy, bestResult.correctCount, bestResult.testCount, bestResult.trainRatio, bestResult.seed, bestResult.componentCount);
     fprintf('BEST_TRAIN_RATIO_AVERAGE_ACCURACY: %.2f%% +/- %.2f%%, trainRatio=%.2f, runs=%d\n', ...
         bestResult.meanAccuracy, bestResult.stdAccuracy, bestResult.trainRatio, bestResult.runCount);
-
 end
 
+scriptRuntimeSeconds = toc(scriptTimer);
+fprintf('SCRIPT_RUNTIME_SECONDS: %.2f\n', scriptRuntimeSeconds);
+
 if ~isempty(failedNames)
-    disp('失败样例（最多显示前 10 个）：');
+    disp('失败样例（最多显示前10个）：');
     showFailCount = min(10, numel(failedNames));
     disp(table(failedNames(1:showFailCount), failedReasons(1:showFailCount), 'VariableNames', {'文件名', '原因'}));
 end
 
-disp('任务完成：已使用 MTCNN + 68关键点完成预处理、图片保存、PCA 和识别准确率检测。');
+disp('任务完成：已停用 MTCNN/批量68点候选推理，并使用快速级联检测、肤色兜底裁剪、直方图均衡化、尺度归一化、PCA 和识别准确率检测。');
 
-%% 局部函数
 shijianRunResult = buildRunResult( ...
-    totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, failedNames, failedReasons, ...
-    mtcnnSuccessRate, preprocessSuccessRate, stImageSavePath, bestResult, searchResults);
+    totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, failedNames, failedReasons, ...
+    mtcnnSuccessRate, preprocessSuccessRate, stImageSavePath, scriptRuntimeSeconds, bestResult, searchResults);
 assignin('base', 'shijianRunResult', shijianRunResult);
 save(resultMatPath, 'shijianRunResult');
 fprintf('RUN_RESULT_MAT_PATH: %s\n', resultMatPath);
 
+%% 局部函数
 function ext = filepartsExt(name)
     [~, ~, ext] = fileparts(name);
 end
@@ -322,7 +198,7 @@ function img = readImageUpright(path)
             end
         end
     catch
-        % 某些图片没有 EXIF 信息，直接使用 imread 结果即可。
+        % 部分图片没有 EXIF 信息，直接使用 imread 结果即可。
     end
 end
 
@@ -334,31 +210,232 @@ function gray = toGray(img)
     gray = shijian_face_core('toGray', img);
 end
 
-function [bbox, score] = detectFaceMTCNN(img, detector, maxDetectionSides)
-    [bbox, score] = shijian_face_core('detectFaceMTCNN', img, detector, maxDetectionSides);
+function featureVector = extractRecognitionFeatures(faceGray)
+    featureVector = shijian_face_core('extractRecognitionFeatures', faceGray);
 end
 
-function box = expandAndClipBbox(bbox, marginRatio, imgSize)
-    box = shijian_face_core('expandAndClipBbox', bbox, marginRatio, imgSize);
+function [faceNormalized, cropMeta, methodName] = fastFacePreprocess(img, normalizedSize, targetFaceOccupancy)
+    img = im2uint8(ensureRGB(img));
+    [faceBox, methodName] = detectFastFaceBox(img);
+    cropBox = faceCropBoxFromFaceBox(faceBox, size(img), targetFaceOccupancy);
+    faceCrop = imcrop(img, cropBox);
+    if isempty(faceCrop)
+        cropBox = [1, 1, size(img, 2), size(img, 1)];
+        faceBox = cropBox;
+        methodName = "full_image_fallback";
+        faceCrop = img;
+    end
+
+    faceGray = im2uint8(toGray(faceCrop));
+    faceGray = localContrastNormalize(faceGray);
+    faceNormalized = imresize(faceGray, normalizedSize);
+
+    cropMeta = struct();
+    cropMeta.valid = true;
+    cropMeta.method = methodName;
+    cropMeta.faceBox = faceBox;
+    cropMeta.cropBox = cropBox;
+    cropMeta.occupancy = faceOccupancyInCrop(faceBox, cropBox);
 end
 
-function eyePts = eyeCentersFrom68(landmarks68)
-    if size(landmarks68, 1) < 68 || size(landmarks68, 2) ~= 2
-        eyePts = [];
+function [bbox, methodName] = detectFastFaceBox(img)
+    [bbox, ok] = detectCascadeFaceBox(img);
+    if ok
+        methodName = "cascade";
         return;
     end
 
-    eyeA = mean(landmarks68(37:42, :), 1);
-    eyeB = mean(landmarks68(43:48, :), 1);
-    if any(~isfinite([eyeA, eyeB]))
-        eyePts = [];
+    [bbox, ok] = detectSkinFaceBox(img);
+    if ok
+        methodName = "skin_region";
         return;
     end
 
-    if eyeA(1) <= eyeB(1)
-        eyePts = [eyeA; eyeB];
+    bbox = fallbackFaceBox(size(img));
+    methodName = "center_fallback";
+end
+
+function [bestBox, ok] = detectCascadeFaceBox(img)
+    persistent detectors detectorReady
+    ok = false;
+    bestBox = [];
+
+    if isempty(detectorReady)
+        detectorReady = false;
+        detectors = {};
+        detectorNames = {'FrontalFaceCART', 'FrontalFaceLBP', 'ProfileFace'};
+        for i = 1:numel(detectorNames)
+            try
+                d = vision.CascadeObjectDetector(detectorNames{i});
+                d.MergeThreshold = 4;
+                d.ScaleFactor = 1.08;
+                detectors{end + 1} = d; %#ok<AGROW>
+            catch
+            end
+        end
+        detectorReady = ~isempty(detectors);
+    end
+
+    if ~detectorReady
+        return;
+    end
+
+    gray = toGray(img);
+    scale = min(1, 640 / max(size(gray, 1), size(gray, 2)));
+    if scale < 1
+        detectImg = imresize(gray, scale);
     else
-        eyePts = [eyeB; eyeA];
+        detectImg = gray;
+    end
+
+    allBoxes = zeros(0, 4);
+    for i = 1:numel(detectors)
+        try
+            b = step(detectors{i}, detectImg);
+            if ~isempty(b)
+                allBoxes = [allBoxes; double(b) ./ scale]; %#ok<AGROW>
+            end
+        catch
+        end
+    end
+
+    if isempty(allBoxes)
+        return;
+    end
+
+    bestBox = selectBestFaceBox(allBoxes, size(img));
+    ok = ~isempty(bestBox);
+end
+
+function [bbox, ok] = detectSkinFaceBox(img)
+    ok = false;
+    bbox = [];
+    try
+        rgb = im2uint8(ensureRGB(img));
+        ycbcr = rgb2ycbcr(rgb);
+        cb = ycbcr(:, :, 2);
+        cr = ycbcr(:, :, 3);
+        mask = cb >= 75 & cb <= 135 & cr >= 130 & cr <= 180;
+        mask = imclose(mask, strel('disk', 5));
+        mask = imopen(mask, strel('disk', 3));
+        mask = imfill(mask, 'holes');
+        mask = bwareaopen(mask, max(80, round(numel(mask) * 0.002)));
+        cc = bwconncomp(mask);
+        if cc.NumObjects == 0
+            return;
+        end
+
+        stats = regionprops(cc, 'BoundingBox', 'Area', 'Centroid');
+        imgH = size(img, 1);
+        imgW = size(img, 2);
+        bestScore = -inf;
+        for i = 1:numel(stats)
+            b = stats(i).BoundingBox;
+            areaRatio = stats(i).Area / (imgH * imgW);
+            if areaRatio < 0.01 || areaRatio > 0.75
+                continue;
+            end
+            aspect = b(3) / max(b(4), 1);
+            if aspect < 0.35 || aspect > 1.80
+                continue;
+            end
+            centerPenalty = abs(stats(i).Centroid(1) - imgW / 2) / imgW + 0.7 * abs(stats(i).Centroid(2) - imgH * 0.42) / imgH;
+            score = areaRatio - 0.18 * centerPenalty - 0.05 * abs(aspect - 0.85);
+            if score > bestScore
+                bestScore = score;
+                bbox = b;
+            end
+        end
+
+        if isempty(bbox)
+            return;
+        end
+        bbox = clipRect(bbox, [imgH, imgW]);
+        ok = bbox(3) >= 30 && bbox(4) >= 30;
+    catch
+        ok = false;
+        bbox = [];
+    end
+end
+
+function bbox = fallbackFaceBox(imgSize)
+    h = double(imgSize(1));
+    w = double(imgSize(2));
+    if h >= w
+        boxW = 0.82 * w;
+        boxH = min(0.70 * h, 1.18 * boxW);
+        cx = 0.50 * w;
+        cy = 0.38 * h;
+    else
+        boxH = 0.82 * h;
+        boxW = min(0.56 * w, 0.90 * boxH);
+        cx = 0.50 * w;
+        cy = 0.46 * h;
+    end
+    bbox = clipRect([cx - boxW / 2, cy - boxH / 2, boxW, boxH], [h, w]);
+end
+
+function bestBox = selectBestFaceBox(boxes, imgSize)
+    h = double(imgSize(1));
+    w = double(imgSize(2));
+    bestScore = -inf;
+    bestBox = [];
+    for i = 1:size(boxes, 1)
+        b = clipRect(boxes(i, :), [h, w]);
+        if b(3) < 30 || b(4) < 30
+            continue;
+        end
+        areaRatio = (b(3) * b(4)) / (h * w);
+        centerX = b(1) + b(3) / 2;
+        centerY = b(2) + b(4) / 2;
+        centerPenalty = abs(centerX - w / 2) / w + 0.7 * abs(centerY - h * 0.42) / h;
+        aspectPenalty = abs((b(3) / max(b(4), 1)) - 0.82);
+        score = areaRatio - 0.18 * centerPenalty - 0.03 * aspectPenalty;
+        if score > bestScore
+            bestScore = score;
+            bestBox = b;
+        end
+    end
+end
+
+function cropBox = faceCropBoxFromFaceBox(faceBox, imgSize, targetFaceOccupancy)
+    h = double(imgSize(1));
+    w = double(imgSize(2));
+    faceBox = clipRect(faceBox, [h, w]);
+    scale = 1 / sqrt(max(0.01, min(0.99, targetFaceOccupancy)));
+    cropW = max(faceBox(3), faceBox(3) * scale);
+    cropH = max(faceBox(4), faceBox(4) * scale);
+    cx = faceBox(1) + faceBox(3) / 2;
+    cy = faceBox(2) + faceBox(4) / 2;
+    cropBox = clipRect([cx - cropW / 2, cy - cropH / 2, cropW, cropH], [h, w]);
+end
+
+function rect = clipRect(rect, imgSize)
+    h = double(imgSize(1));
+    w = double(imgSize(2));
+    x1 = max(1, min(w, double(rect(1))));
+    y1 = max(1, min(h, double(rect(2))));
+    x2 = max(1, min(w, double(rect(1)) + double(rect(3)) - 1));
+    y2 = max(1, min(h, double(rect(2)) + double(rect(4)) - 1));
+    rect = [x1, y1, max(1, x2 - x1 + 1), max(1, y2 - y1 + 1)];
+end
+
+function occupancy = faceOccupancyInCrop(faceBox, cropBox)
+    x1 = max(faceBox(1), cropBox(1));
+    y1 = max(faceBox(2), cropBox(2));
+    x2 = min(faceBox(1) + faceBox(3), cropBox(1) + cropBox(3));
+    y2 = min(faceBox(2) + faceBox(4), cropBox(2) + cropBox(4));
+    overlapW = max(0, x2 - x1);
+    overlapH = max(0, y2 - y1);
+    occupancy = min(1, (overlapW * overlapH) / max(1, cropBox(3) * cropBox(4)));
+end
+
+function faceGray = localContrastNormalize(faceGray)
+    faceGray = im2uint8(faceGray);
+    try
+        faceGray = adapthisteq(faceGray, 'ClipLimit', 0.015, 'Distribution', 'rayleigh');
+    catch
+        faceGray = histeq(faceGray);
     end
 end
 
@@ -377,57 +454,6 @@ function [saveStem, identityName] = getFolderNames(fullPath, rootPath)
     identityName = parts{1};
 end
 
-function featureVector = extractRecognitionFeatures(faceGray)
-    featureVector = shijian_face_core('extractRecognitionFeatures', faceGray);
-end
-
-function [faceOnlyCrop, cropMeta] = cropAlignedFaceOnly(faceGray, alignedLandmarks68, normalizedSize, targetFaceOccupancy)
-    cropMeta = struct('occupancy', 0, 'valid', false);
-    validPts = alignedLandmarks68(all(isfinite(alignedLandmarks68), 2), :);
-    validPts = validPts(validPts(:, 1) >= 1 & validPts(:, 1) <= normalizedSize(2) & ...
-        validPts(:, 2) >= 1 & validPts(:, 2) <= normalizedSize(1), :);
-
-    if size(validPts, 1) < 20
-        faceOnlyCrop = faceGray;
-        cropMeta.occupancy = 0;
-        return;
-    end
-
-    x1 = min(validPts(:, 1));
-    y1 = min(validPts(:, 2));
-    x2 = max(validPts(:, 1));
-    y2 = max(validPts(:, 2));
-    w = x2 - x1;
-    h = y2 - y1;
-
-    scale = sqrt(max(0.01, min(0.99, targetFaceOccupancy)));
-    cropW = max(1, w / scale);
-    cropH = max(1, h / scale);
-    centerX = (x1 + x2) / 2;
-    centerY = (y1 + y2) / 2;
-    cropX1 = max(1, centerX - cropW / 2);
-    cropY1 = max(1, centerY - cropH / 2);
-    cropX2 = min(normalizedSize(2), centerX + cropW / 2);
-    cropY2 = min(normalizedSize(1), centerY + cropH / 2);
-
-    cropRect = [cropX1, cropY1, max(1, cropX2 - cropX1), max(1, cropY2 - cropY1)];
-    faceOnlyCrop = imcrop(faceGray, cropRect);
-    if isempty(faceOnlyCrop)
-        faceOnlyCrop = faceGray;
-        cropMeta.occupancy = 0;
-        return;
-    end
-
-    normalizedPts = [(validPts(:, 1) - cropRect(1)) * normalizedSize(2) / cropRect(3), ...
-        (validPts(:, 2) - cropRect(2)) * normalizedSize(1) / cropRect(4)];
-    normalizedPts(:, 1) = min(max(normalizedPts(:, 1), 1), normalizedSize(2));
-    normalizedPts(:, 2) = min(max(normalizedPts(:, 2), 1), normalizedSize(1));
-    landmarkW = max(normalizedPts(:, 1)) - min(normalizedPts(:, 1));
-    landmarkH = max(normalizedPts(:, 2)) - min(normalizedPts(:, 2));
-    cropMeta.occupancy = (landmarkW * landmarkH) / (normalizedSize(1) * normalizedSize(2));
-    cropMeta.valid = true;
-end
-
 function [ok, reason, occupancy] = verifyPreprocessedFaceOnly(imagePath, cropMeta, minimumFaceOccupancy)
     ok = false;
     reason = "";
@@ -444,14 +470,14 @@ function [ok, reason, occupancy] = verifyPreprocessedFaceOnly(imagePath, cropMet
     end
 
     if ~isfield(cropMeta, 'valid') || ~cropMeta.valid
-        reason = "68点有效点不足，无法确认人脸占比";
+        reason = "人脸裁剪元数据无效，无法确认人脸占比";
         return;
     end
 
     occupancy = cropMeta.occupancy;
     ok = occupancy >= minimumFaceOccupancy;
     if ~ok
-        reason = sprintf('68点几何人脸占比不足：%.2f%%', 100 * occupancy);
+        reason = sprintf('几何人脸占比不足：%.2f%%', 100 * occupancy);
     end
 end
 
@@ -603,29 +629,13 @@ function [accuracy, correctCount, predictedLabels] = evaluateNearestNeighborTrai
     accuracy = 100 * correctCount / numel(testLabels);
 end
 
-function [accuracy, correctCount, predictedLabels] = evaluateNearestNeighbor(features, labels)
-    sampleCount = size(features, 1);
-    predictedLabels = strings(sampleCount, 1);
-    distanceMatrix = pdist2(features, features, 'cosine');
-    distanceMatrix(1:sampleCount + 1:end) = inf;
-
-    for i = 1:sampleCount
-        [~, nearestIdx] = min(distanceMatrix(i, :));
-        predictedLabels(i) = labels(nearestIdx);
-    end
-
-    correct = predictedLabels == labels;
-    correctCount = sum(correct);
-    accuracy = 100 * correctCount / sampleCount;
-end
-
-function runResult = buildRunResult(totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, failedNames, failedReasons, mtcnnSuccessRate, preprocessSuccessRate, savePath, bestResult, searchResults)
-    if nargin < 14 || isempty(bestResult)
+function runResult = buildRunResult(totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, failedNames, failedReasons, mtcnnSuccessRate, preprocessSuccessRate, savePath, scriptRuntimeSeconds, bestResult, searchResults)
+    if nargin < 16 || isempty(bestResult)
         bestResult = struct('accuracy', NaN, 'correctCount', 0, 'testCount', 0, 'trainRatio', NaN, ...
             'seed', NaN, 'componentCount', 0, 'meanAccuracy', NaN, 'stdAccuracy', NaN, 'runCount', 0, ...
             'misclassifiedSamples', emptyMisclassifiedTable());
     end
-    if nargin < 15 || isempty(searchResults)
+    if nargin < 17 || isempty(searchResults)
         searchResults = table();
     end
 
@@ -633,17 +643,18 @@ function runResult = buildRunResult(totalImages, mtcnnCount, processedCount, val
     if ~isempty(failedNames)
         failedSamples = table(failedNames, failedReasons, 'VariableNames', {'FileName', 'Reason'});
     end
-    savedSamples = table(validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, ...
-        'VariableNames', {'FileName', 'TrueLabel', 'OriginalPath', 'PreprocessedPath', 'FaceOccupancy'});
+    savedSamples = table(validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, ...
+        'VariableNames', {'FileName', 'TrueLabel', 'OriginalPath', 'PreprocessedPath', 'FaceOccupancy', 'PreprocessMethod'});
 
     runResult = struct( ...
-        'timestamp', datestr(now, 31), ...
+        'timestamp', char(datetime("now", "Format", "yyyy-MM-dd'T'HH:mm:ss")), ...
         'totalImages', totalImages, ...
         'mtcnnCount', mtcnnCount, ...
         'processedCount', processedCount, ...
         'savedImageCount', numel(validNames), ...
         'mtcnnSuccessRate', mtcnnSuccessRate, ...
         'preprocessSuccessRate', preprocessSuccessRate, ...
+        'scriptRuntimeSeconds', scriptRuntimeSeconds, ...
         'bestAccuracy', bestResult.accuracy, ...
         'bestCorrectCount', bestResult.correctCount, ...
         'bestTestCount', bestResult.testCount, ...
@@ -679,51 +690,4 @@ function deletedCount = clearSavedPhotoFiles(folderPath, photoExts)
             warning('Failed to delete old photo file "%s": %s', fullfile(files(i).folder, files(i).name), ME.message);
         end
     end
-end
-
-function cleanupTempFolder(tempRoot)
-    if exist(tempRoot, 'dir')
-        try
-            rmdir(tempRoot, 's');
-        catch
-        end
-    end
-end
-
-function writePythonHelper(helperPath)
-    lines = [
-        "import sys, csv";
-        "import cv2";
-        "import numpy as np";
-        "import onnxruntime as ort";
-        "";
-        "model_path = sys.argv[1]";
-        "manifest_path = sys.argv[2]";
-        "output_path = sys.argv[3]";
-        "session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])";
-        "input_name = session.get_inputs()[0].name";
-        "header = ['id']";
-        "for i in range(68):";
-        "    header += [f'x{i+1}', f'y{i+1}']";
-        "with open(manifest_path, 'r', encoding='utf-8-sig', newline='') as fin, open(output_path, 'w', encoding='utf-8', newline='') as fout:";
-        "    reader = csv.DictReader(fin)";
-        "    writer = csv.writer(fout)";
-        "    writer.writerow(header)";
-        "    for row in reader:";
-        "        img = cv2.imread(row['cropPath'], cv2.IMREAD_COLOR)";
-        "        if img is None:";
-        "            continue";
-        "        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)";
-        "        resized = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0";
-        "        inp = np.transpose(resized, (2, 0, 1))[None, :, :, :]";
-        "        pred = session.run(None, {input_name: inp})[0].reshape(68, 2)";
-        "        if np.nanmax(pred) > 2.0:";
-        "            pred = pred / 112.0";
-        "        h, w = img.shape[:2]";
-        "        vals = []";
-        "        for x, y in pred:";
-        "            vals += [float(x) * w, float(y) * h]";
-        "        writer.writerow([row['id']] + vals)";
-    ];
-    writelines(lines, helperPath);
 end
