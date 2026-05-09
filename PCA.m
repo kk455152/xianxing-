@@ -27,6 +27,7 @@ end
 fprintf('Reading preprocessed face images from: %s\n', datasetPath);
 [samples, labels, sampleNames, imagePaths] = loadFaceDataset(files, imageSize);
 fprintf('Loaded %d images from %d classes.\n', numel(labels), numel(unique(labels)));
+meanFaceImage = mat2gray(reshape(mean(samples, 1), imageSize));
 
 [bestResult, searchResults] = searchPcaRecognition(samples, labels, sampleNames, imagePaths, trainRatioValues, seedValues, componentValues, metricValues);
 
@@ -46,6 +47,7 @@ PCAResult.DatasetPath = datasetPath;
 PCAResult.ImageSize = imageSize;
 PCAResult.ImageCount = numel(labels);
 PCAResult.ClassCount = numel(unique(labels));
+PCAResult.MeanFaceImage = meanFaceImage;
 PCAResult.BestAccuracy = bestResult.Accuracy;
 PCAResult.BestResult = bestResult;
 PCAResult.SearchResults = searchResults;
