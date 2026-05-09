@@ -1,5 +1,5 @@
-%% 线性代数课程项目：快速人脸预处理 + PCA识别评估
-% 流程：OpenCV/Viola-Jones级联检测 -> 肤色区域兜底 -> 人脸紧裁剪 -> 直方图均衡化 -> 尺度归一化 -> PCA识别
+%% 线性代数课程项目：快速人脸预处理
+% 流程：OpenCV/Viola-Jones级联检测 -> 肤色区域兜底 -> 人脸紧裁剪 -> 直方图均衡化 -> 尺度归一化
 % 说明：本脚本已停用 MTCNN 和批量68点候选推理，目标是在保证人脸区域占比的同时缩短运行时间。
 
 clear; clc;
@@ -24,9 +24,6 @@ end
 normalizedSize = [160, 160];
 targetFaceOccupancy = 0.96;
 minimumVerifiedFaceOccupancy = 0.95;
-trainRatioValues = [0.80, 0.90, 0.92];
-splitSeedValues = [20260417:20260426, 20260438];
-varianceToKeep = 90;
 resultMatPath = fullfile(scriptDir, 'shijian_last_result.mat');
 if isfile(resultMatPath)
     delete(resultMatPath);
@@ -43,13 +40,14 @@ allFiles = allFiles(arrayfun(@(f) any(strcmpi(filepartsExt(f.name), supportedExt
 subfolderCounts = containers.Map('KeyType', 'char', 'ValueType', 'int32');
 processedPaths = containers.Map('KeyType', 'char', 'ValueType', 'logical');
 
-pcaSamples = [];
 validLabels = strings(0, 1);
 validNames = strings(0, 1);
 validOriginalPaths = strings(0, 1);
 validPreprocessedPaths = strings(0, 1);
 validFaceOccupancies = zeros(0, 1);
 validPreprocessMethods = strings(0, 1);
+validQualityScores = zeros(0, 1);
+validRepairFlags = false(0, 1);
 failedNames = strings(0, 1);
 failedReasons = strings(0, 1);
 
@@ -90,7 +88,7 @@ for k = 1:length(allFiles)
         sampleName = string(allFiles(k).name);
         saveStemWithIndex = string(sprintf('%s_%d', saveStem, subfolderCounts(saveStem)));
 
-        [faceNormalized, faceCropMeta, preprocessMethod] = fastFacePreprocess(img, normalizedSize, targetFaceOccupancy);
+        [faceNormalized, faceCropMeta, preprocessMethod] = fastFacePreprocess(img, normalizedSize, targetFaceOccupancy, "default");
         saveName = sprintf('%s_fast_face.jpg', saveStemWithIndex);
         savePath = fullfile(stImageSavePath, saveName);
         imwrite(faceNormalized, savePath);
@@ -108,13 +106,15 @@ for k = 1:length(allFiles)
 
         processedCount = processedCount + 1;
         faceOnlyPassCount = faceOnlyPassCount + 1;
-        pcaSamples(processedCount, :) = extractRecognitionFeatures(faceNormalized); %#ok<SAGROW>
         validLabels(processedCount, 1) = string(identityName);
         validNames(processedCount, 1) = sampleName;
         validOriginalPaths(processedCount, 1) = string(fullPath);
         validPreprocessedPaths(processedCount, 1) = string(savePath);
         validFaceOccupancies(processedCount, 1) = faceOccupancy;
         validPreprocessMethods(processedCount, 1) = preprocessMethod;
+        [~, initialQualityScore] = assessSavedFaceQuality(savePath);
+        validQualityScores(processedCount, 1) = initialQualityScore;
+        validRepairFlags(processedCount, 1) = false;
         fprintf('已保存预处理图片：%s，方法：%s，占比：%.2f%%\n', saveName, preprocessMethod, 100 * faceOccupancy);
     catch ME
         failedNames(end + 1, 1) = string(allFiles(k).name); %#ok<SAGROW>
@@ -124,28 +124,19 @@ for k = 1:length(allFiles)
 end
 
 % =========================================================================
-% 4. PCA 降维与识别成功率检测
+% 4. 预处理结果统计
 % =========================================================================
+[validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, validQualityScores, validRepairFlags, repairedCount, deletedLowQualityCount] = ...
+    repairLowQualitySavedFaces(validNames, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, validQualityScores, validRepairFlags, normalizedSize, targetFaceOccupancy, minimumVerifiedFaceOccupancy);
+
 preprocessCoverageRate = 100 * imageCount / max(totalImages, 1);
 preprocessSuccessRate = 100 * processedCount / max(totalImages, 1);
-bestResult = [];
-searchResults = table();
 fprintf('\nMTCNN人脸检测：已停用\n');
 fprintf('快速预处理覆盖率：%.2f%% (%d/%d)\n', preprocessCoverageRate, imageCount, totalImages);
 fprintf('快速人脸预处理成功率：%.2f%% (%d/%d)\n', preprocessSuccessRate, processedCount, totalImages);
 fprintf('预处理后仅人脸区域校验通过率：%.2f%% (%d/%d)\n', 100 * faceOnlyPassCount / max(faceOnlyCheckCount, 1), faceOnlyPassCount, faceOnlyCheckCount);
 
-if processedCount < 3 || numel(unique(validLabels)) < 2
-    warning('有效样本或类别数量不足，无法进行 PCA 识别成功率检测。');
-else
-    [bestResult, searchResults] = searchTrainTestPca(pcaSamples, validLabels, validNames, validOriginalPaths, validPreprocessedPaths, trainRatioValues, splitSeedValues, varianceToKeep);
-    disp('TRAIN_RATIO_SEARCH_RESULTS:');
-    disp(searchResults);
-    fprintf('BEST_TRAIN_TEST_TRUE_PREDICT_SAME_RATE: %.2f%% (%d/%d), trainRatio=%.2f, seed=%d, components=%d\n', ...
-        bestResult.accuracy, bestResult.correctCount, bestResult.testCount, bestResult.trainRatio, bestResult.seed, bestResult.componentCount);
-    fprintf('BEST_TRAIN_RATIO_AVERAGE_ACCURACY: %.2f%% +/- %.2f%%, trainRatio=%.2f, runs=%d\n', ...
-        bestResult.meanAccuracy, bestResult.stdAccuracy, bestResult.trainRatio, bestResult.runCount);
-end
+fprintf('LOW_QUALITY_DELETED_AND_REPROCESSED: %d, REPAIRED_SAVED: %d\n', deletedLowQualityCount, repairedCount);
 
 scriptRuntimeSeconds = toc(scriptTimer);
 fprintf('SCRIPT_RUNTIME_SECONDS: %.2f\n', scriptRuntimeSeconds);
@@ -156,11 +147,11 @@ if ~isempty(failedNames)
     disp(table(failedNames(1:showFailCount), failedReasons(1:showFailCount), 'VariableNames', {'文件名', '原因'}));
 end
 
-disp('任务完成：已停用 MTCNN/批量68点候选推理，并使用快速级联检测、肤色兜底裁剪、直方图均衡化、尺度归一化、PCA 和识别准确率检测。');
+disp('任务完成：已停用 MTCNN/批量68点候选推理，并使用快速级联检测、肤色兜底裁剪、直方图均衡化和尺度归一化完成预处理。');
 
 shijianRunResult = buildRunResult( ...
-    totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, failedNames, failedReasons, ...
-    mtcnnSuccessRate, preprocessSuccessRate, stImageSavePath, scriptRuntimeSeconds, bestResult, searchResults);
+    totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, validQualityScores, validRepairFlags, failedNames, failedReasons, ...
+    mtcnnSuccessRate, preprocessSuccessRate, stImageSavePath, scriptRuntimeSeconds);
 assignin('base', 'shijianRunResult', shijianRunResult);
 save(resultMatPath, 'shijianRunResult');
 fprintf('RUN_RESULT_MAT_PATH: %s\n', resultMatPath);
@@ -210,13 +201,16 @@ function gray = toGray(img)
     gray = shijian_face_core('toGray', img);
 end
 
-function featureVector = extractRecognitionFeatures(faceGray)
-    featureVector = shijian_face_core('extractRecognitionFeatures', faceGray);
-end
-
-function [faceNormalized, cropMeta, methodName] = fastFacePreprocess(img, normalizedSize, targetFaceOccupancy)
+function [faceNormalized, cropMeta, methodName] = fastFacePreprocess(img, normalizedSize, targetFaceOccupancy, mode)
+    if nargin < 4
+        mode = "default";
+    end
     img = im2uint8(ensureRGB(img));
-    [faceBox, methodName] = detectFastFaceBox(img);
+    if mode == "repair"
+        [faceBox, methodName] = detectRepairFaceBox(img);
+    else
+        [faceBox, methodName] = detectFastFaceBox(img);
+    end
     cropBox = faceCropBoxFromFaceBox(faceBox, size(img), targetFaceOccupancy);
     faceCrop = imcrop(img, cropBox);
     if isempty(faceCrop)
@@ -253,6 +247,153 @@ function [bbox, methodName] = detectFastFaceBox(img)
 
     bbox = fallbackFaceBox(size(img));
     methodName = "center_fallback";
+end
+
+function [bbox, methodName] = detectRepairFaceBox(img)
+    candidates = zeros(0, 4);
+    methods = strings(0, 1);
+
+    [box, ok] = detectCascadeFaceBox(img);
+    if ok
+        candidates(end + 1, :) = box; %#ok<AGROW>
+        methods(end + 1, 1) = "repair_cascade"; %#ok<AGROW>
+    end
+
+    [box, ok] = detectSkinFaceBox(img);
+    if ok
+        candidates(end + 1, :) = box; %#ok<AGROW>
+        methods(end + 1, 1) = "repair_skin_region"; %#ok<AGROW>
+    end
+
+    candidates(end + 1, :) = fallbackFaceBox(size(img)); %#ok<AGROW>
+    methods(end + 1, 1) = "repair_center_fallback"; %#ok<AGROW>
+
+    imgSize = size(img);
+    bestScore = -inf;
+    bbox = candidates(1, :);
+    methodName = methods(1);
+    for i = 1:size(candidates, 1)
+        b = clipRect(candidates(i, :), imgSize);
+        crop = imcrop(img, faceCropBoxFromFaceBox(b, imgSize, 0.97));
+        if isempty(crop)
+            continue;
+        end
+        gray = localContrastNormalize(im2uint8(toGray(crop)));
+        gray = imresize(gray, [160, 160]);
+        score = assessFaceImageQuality(gray);
+        if score > bestScore
+            bestScore = score;
+            bbox = b;
+            methodName = methods(i);
+        end
+    end
+end
+
+function [validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, validQualityScores, validRepairFlags, repairedCount, deletedLowQualityCount] = repairLowQualitySavedFaces(validNames, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, validQualityScores, validRepairFlags, normalizedSize, targetFaceOccupancy, minimumVerifiedFaceOccupancy)
+    qualityThreshold = 0.48;
+    repairedCount = 0;
+    deletedLowQualityCount = 0;
+
+    for i = 1:numel(validPreprocessedPaths)
+        savePath = char(validPreprocessedPaths(i));
+        [qualityOk, qualityScore] = assessSavedFaceQuality(savePath);
+        validQualityScores(i, 1) = qualityScore;
+        if qualityOk
+            continue;
+        end
+
+        deletedLowQualityCount = deletedLowQualityCount + 1;
+        try
+            originalImg = im2uint8(ensureRGB(readImageUpright(char(validOriginalPaths(i)))));
+            if isfile(savePath)
+                delete(savePath);
+            end
+            [faceNormalized, faceCropMeta, preprocessMethod] = fastFacePreprocess(originalImg, normalizedSize, max(targetFaceOccupancy, 0.97), "repair");
+            imwrite(faceNormalized, savePath);
+            [faceOnlyOk, ~, faceOccupancy] = verifyPreprocessedFaceOnly(savePath, faceCropMeta, minimumVerifiedFaceOccupancy);
+            [repairQualityOk, repairQualityScore] = assessSavedFaceQuality(savePath);
+            if faceOnlyOk && (repairQualityOk || repairQualityScore >= qualityScore)
+                validFaceOccupancies(i, 1) = faceOccupancy;
+                validPreprocessMethods(i, 1) = preprocessMethod;
+                validQualityScores(i, 1) = repairQualityScore;
+                validRepairFlags(i, 1) = true;
+                repairedCount = repairedCount + 1;
+            else
+                if isfile(savePath)
+                    delete(savePath);
+                end
+                [faceNormalized, faceCropMeta, preprocessMethod] = fastFacePreprocess(originalImg, normalizedSize, targetFaceOccupancy, "default");
+                imwrite(faceNormalized, savePath);
+                [~, ~, faceOccupancy] = verifyPreprocessedFaceOnly(savePath, faceCropMeta, minimumVerifiedFaceOccupancy);
+                [~, fallbackQualityScore] = assessSavedFaceQuality(savePath);
+                validFaceOccupancies(i, 1) = faceOccupancy;
+                validPreprocessMethods(i, 1) = preprocessMethod + "_restored";
+                validQualityScores(i, 1) = fallbackQualityScore;
+            end
+            fprintf('REPROCESS_LOW_QUALITY_FACE: %s, oldScore=%.3f, newScore=%.3f\n', validNames(i), qualityScore, validQualityScores(i, 1));
+        catch ME
+            warning('Failed to reprocess low quality face "%s": %s', savePath, ME.message);
+            try
+                originalImg = im2uint8(ensureRGB(readImageUpright(char(validOriginalPaths(i)))));
+                [faceNormalized, faceCropMeta, preprocessMethod] = fastFacePreprocess(originalImg, normalizedSize, targetFaceOccupancy, "default");
+                imwrite(faceNormalized, savePath);
+                [~, ~, faceOccupancy] = verifyPreprocessedFaceOnly(savePath, faceCropMeta, minimumVerifiedFaceOccupancy);
+                [~, restoredQualityScore] = assessSavedFaceQuality(savePath);
+                validFaceOccupancies(i, 1) = faceOccupancy;
+                validPreprocessMethods(i, 1) = preprocessMethod + "_exception_restored";
+                validQualityScores(i, 1) = restoredQualityScore;
+            catch restoreME
+                warning('Failed to restore low quality face "%s": %s', savePath, restoreME.message);
+            end
+        end
+    end
+
+    finalLowQuality = validQualityScores < qualityThreshold;
+    if any(finalLowQuality)
+        fprintf('LOW_QUALITY_AFTER_REPROCESS_COUNT: %d\n', sum(finalLowQuality));
+    end
+end
+
+function [ok, score] = assessSavedFaceQuality(imagePath)
+    ok = false;
+    score = 0;
+    if ~isfile(imagePath)
+        return;
+    end
+    try
+        img = imread(imagePath);
+        score = assessFaceImageQuality(img);
+        ok = score >= 0.48;
+    catch
+        score = 0;
+    end
+end
+
+function score = assessFaceImageQuality(img)
+    gray = im2single(toGray(img));
+    if isempty(gray)
+        score = 0;
+        return;
+    end
+
+    lapKernel = [0 1 0; 1 -4 1; 0 1 0];
+    lap = imfilter(gray, lapKernel, 'replicate');
+    sharpness = var(lap(:), 0);
+    sharpScore = min(1, sharpness / 0.006);
+    contrastScore = min(1, std(gray(:), 0) / 0.22);
+    entropyScore = min(1, entropy(im2uint8(gray)) / 7.2);
+    meanVal = mean(gray(:));
+    brightnessScore = max(0, 1 - abs(meanVal - 0.50) / 0.42);
+    borderWidth = max(2, round(min(size(gray, 1), size(gray, 2)) * 0.06));
+    topPixels = gray(1:borderWidth, :);
+    bottomPixels = gray(end-borderWidth+1:end, :);
+    leftPixels = gray(:, 1:borderWidth);
+    rightPixels = gray(:, end-borderWidth+1:end);
+    borderPixels = [topPixels(:); bottomPixels(:); leftPixels(:); rightPixels(:)];
+    borderPenalty = max(0, 1 - mean(borderPixels(:)));
+
+    score = 0.34 * sharpScore + 0.28 * contrastScore + 0.22 * entropyScore + 0.12 * brightnessScore + 0.04 * borderPenalty;
+    score = max(0, min(1, score));
 end
 
 function [bestBox, ok] = detectCascadeFaceBox(img)
@@ -481,170 +622,13 @@ function [ok, reason, occupancy] = verifyPreprocessedFaceOnly(imagePath, cropMet
     end
 end
 
-function [bestResult, searchResults] = searchTrainTestPca(samples, labels, sampleNames, originalPaths, preprocessedPaths, trainRatioValues, seedValues, varianceToKeep)
-    rows = [];
-    bestRun = struct('accuracy', -inf, 'correctCount', 0, 'testCount', 0, 'trainRatio', NaN, ...
-        'seed', NaN, 'componentCount', 0, 'meanAccuracy', NaN, 'stdAccuracy', NaN, 'runCount', 0, ...
-        'misclassifiedSamples', emptyMisclassifiedTable(), 'predictedLabels', strings(0, 1), ...
-        'testLabels', strings(0, 1), 'testSampleNames', strings(0, 1));
-
-    for r = 1:numel(trainRatioValues)
-        trainRatio = trainRatioValues(r);
-        accuracies = zeros(numel(seedValues), 1);
-        correctCounts = zeros(numel(seedValues), 1);
-        testCounts = zeros(numel(seedValues), 1);
-        componentCounts = zeros(numel(seedValues), 1);
-
-        for s = 1:numel(seedValues)
-            seed = seedValues(s);
-            [accuracy, correctCount, testCount, componentCount, misclassifiedSamples, predictedLabels, testLabels, testSampleNames] = ...
-                evaluateTrainTestPcaRun(samples, labels, sampleNames, originalPaths, preprocessedPaths, trainRatio, seed, varianceToKeep);
-            accuracies(s) = accuracy;
-            correctCounts(s) = correctCount;
-            testCounts(s) = testCount;
-            componentCounts(s) = componentCount;
-
-            if accuracy > bestRun.accuracy
-                bestRun.accuracy = accuracy;
-                bestRun.correctCount = correctCount;
-                bestRun.testCount = testCount;
-                bestRun.trainRatio = trainRatio;
-                bestRun.seed = seed;
-                bestRun.componentCount = componentCount;
-                bestRun.misclassifiedSamples = misclassifiedSamples;
-                bestRun.predictedLabels = predictedLabels;
-                bestRun.testLabels = testLabels;
-                bestRun.testSampleNames = testSampleNames;
-            end
-        end
-
-        row = table(trainRatio, mean(accuracies, 'omitnan'), std(accuracies, 'omitnan'), min(accuracies), max(accuracies), ...
-            mean(componentCounts, 'omitnan'), sum(correctCounts), sum(testCounts), numel(seedValues), ...
-            'VariableNames', {'TrainRatio', 'MeanAccuracy', 'StdAccuracy', 'MinAccuracy', 'MaxAccuracy', ...
-            'MeanComponents', 'TotalCorrect', 'TotalTest', 'Runs'});
-        rows = [rows; row]; %#ok<AGROW>
-    end
-
-    searchResults = rows;
-    bestResult = bestRun;
-    bestRatioIdx = find(searchResults.TrainRatio == bestRun.trainRatio, 1);
-    if isempty(bestRatioIdx)
-        [~, bestRatioIdx] = max(searchResults.MeanAccuracy);
-    end
-    bestResult.meanAccuracy = searchResults.MeanAccuracy(bestRatioIdx);
-    bestResult.stdAccuracy = searchResults.StdAccuracy(bestRatioIdx);
-    bestResult.runCount = searchResults.Runs(bestRatioIdx);
-end
-
-function [accuracy, correctCount, testCount, componentCount, misclassifiedSamples, predictedLabels, testLabels, testSampleNames] = evaluateTrainTestPcaRun(samples, labels, sampleNames, originalPaths, preprocessedPaths, trainRatio, seed, varianceToKeep)
-    misclassifiedSamples = emptyMisclassifiedTable();
-    predictedLabels = strings(0, 1);
-    testLabels = strings(0, 1);
-    testSampleNames = strings(0, 1);
-    [trainIdx, testIdx] = stratifiedTrainTestSplit(labels, trainRatio, seed);
-    if isempty(testIdx) || numel(unique(labels(trainIdx))) < 2
-        accuracy = NaN;
-        correctCount = 0;
-        testCount = 0;
-        componentCount = 0;
-        return;
-    end
-
-    trainSamples = samples(trainIdx, :);
-    testSamples = samples(testIdx, :);
-    testLabels = labels(testIdx);
-    testSampleNames = sampleNames(testIdx);
-    testOriginalPaths = originalPaths(testIdx);
-    testPreprocessedPaths = preprocessedPaths(testIdx);
-    [trainSamples, featureMu, featureSigma] = standardizeTrainFeatures(trainSamples);
-    testSamples = standardizeTestFeatures(testSamples, featureMu, featureSigma);
-    [coeff, trainScore, ~, ~, explained, mu] = pca(double(trainSamples));
-    componentCount = find(cumsum(explained) >= varianceToKeep, 1);
-    if isempty(componentCount)
-        componentCount = size(trainScore, 2);
-    end
-    componentCount = max(1, min(componentCount, size(trainScore, 2)));
-
-    trainFeatures = trainScore(:, 1:componentCount);
-    testFeatures = (double(testSamples) - mu) * coeff(:, 1:componentCount);
-    [accuracy, correctCount, predictedLabels] = evaluateNearestNeighborTrainTest(trainFeatures, labels(trainIdx), testFeatures, testLabels);
-    testCount = numel(testIdx);
-
-    wrongMask = predictedLabels ~= testLabels;
-    if any(wrongMask)
-        misclassifiedSamples = table(testSampleNames(wrongMask), testLabels(wrongMask), predictedLabels(wrongMask), ...
-            testOriginalPaths(wrongMask), testPreprocessedPaths(wrongMask), ...
-            'VariableNames', {'FileName', 'TrueLabel', 'PredictedLabel', 'OriginalPath', 'PreprocessedPath'});
-    end
-end
-
-function [trainIdx, testIdx] = stratifiedTrainTestSplit(labels, trainRatio, seed)
-    oldRng = rng;
-    cleanupRng = onCleanup(@() rng(oldRng));
-    rng(seed);
-
-    classes = unique(labels);
-    trainIdx = [];
-    testIdx = [];
-
-    for c = 1:numel(classes)
-        idx = find(labels == classes(c));
-        idx = idx(randperm(numel(idx)));
-
-        if isscalar(idx)
-            trainIdx = [trainIdx; idx(:)]; %#ok<AGROW>
-            continue;
-        end
-
-        trainCount = floor(trainRatio * numel(idx));
-        trainCount = max(1, min(trainCount, numel(idx) - 1));
-        trainIdx = [trainIdx; idx(1:trainCount)]; %#ok<AGROW>
-        testIdx = [testIdx; idx(trainCount + 1:end)]; %#ok<AGROW>
-    end
-
-    if ~isempty(trainIdx)
-        trainIdx = trainIdx(randperm(numel(trainIdx)));
-    end
-    if ~isempty(testIdx)
-        testIdx = testIdx(randperm(numel(testIdx)));
-    end
-
-    clear cleanupRng;
-end
-
-function [standardizedFeatures, featureMu, featureSigma] = standardizeTrainFeatures(features)
-    [standardizedFeatures, featureMu, featureSigma] = shijian_face_core('standardizeTrainFeatures', features);
-end
-
-function standardizedFeatures = standardizeTestFeatures(features, featureMu, featureSigma)
-    standardizedFeatures = shijian_face_core('standardizeTestFeatures', features, featureMu, featureSigma);
-end
-
-function [accuracy, correctCount, predictedLabels] = evaluateNearestNeighborTrainTest(trainFeatures, trainLabels, testFeatures, testLabels)
-    distanceMatrix = pdist2(testFeatures, trainFeatures, 'cosine');
-    [~, nearestIdx] = min(distanceMatrix, [], 2);
-    predictedLabels = trainLabels(nearestIdx);
-    correct = predictedLabels == testLabels;
-    correctCount = sum(correct);
-    accuracy = 100 * correctCount / numel(testLabels);
-end
-
-function runResult = buildRunResult(totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, failedNames, failedReasons, mtcnnSuccessRate, preprocessSuccessRate, savePath, scriptRuntimeSeconds, bestResult, searchResults)
-    if nargin < 16 || isempty(bestResult)
-        bestResult = struct('accuracy', NaN, 'correctCount', 0, 'testCount', 0, 'trainRatio', NaN, ...
-            'seed', NaN, 'componentCount', 0, 'meanAccuracy', NaN, 'stdAccuracy', NaN, 'runCount', 0, ...
-            'misclassifiedSamples', emptyMisclassifiedTable());
-    end
-    if nargin < 17 || isempty(searchResults)
-        searchResults = table();
-    end
-
+function runResult = buildRunResult(totalImages, mtcnnCount, processedCount, validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, validQualityScores, validRepairFlags, failedNames, failedReasons, mtcnnSuccessRate, preprocessSuccessRate, savePath, scriptRuntimeSeconds)
     failedSamples = table();
     if ~isempty(failedNames)
         failedSamples = table(failedNames, failedReasons, 'VariableNames', {'FileName', 'Reason'});
     end
-    savedSamples = table(validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, ...
-        'VariableNames', {'FileName', 'TrueLabel', 'OriginalPath', 'PreprocessedPath', 'FaceOccupancy', 'PreprocessMethod'});
+    savedSamples = table(validNames, validLabels, validOriginalPaths, validPreprocessedPaths, validFaceOccupancies, validPreprocessMethods, validQualityScores, validRepairFlags, ...
+        'VariableNames', {'FileName', 'TrueLabel', 'OriginalPath', 'PreprocessedPath', 'FaceOccupancy', 'PreprocessMethod', 'QualityScore', 'WasReprocessed'});
 
     runResult = struct( ...
         'timestamp', char(datetime("now", "Format", "yyyy-MM-dd'T'HH:mm:ss")), ...
@@ -655,25 +639,9 @@ function runResult = buildRunResult(totalImages, mtcnnCount, processedCount, val
         'mtcnnSuccessRate', mtcnnSuccessRate, ...
         'preprocessSuccessRate', preprocessSuccessRate, ...
         'scriptRuntimeSeconds', scriptRuntimeSeconds, ...
-        'bestAccuracy', bestResult.accuracy, ...
-        'bestCorrectCount', bestResult.correctCount, ...
-        'bestTestCount', bestResult.testCount, ...
-        'bestTrainRatio', bestResult.trainRatio, ...
-        'bestSeed', bestResult.seed, ...
-        'bestComponentCount', bestResult.componentCount, ...
-        'meanAccuracy', bestResult.meanAccuracy, ...
-        'stdAccuracy', bestResult.stdAccuracy, ...
-        'runCount', bestResult.runCount, ...
         'savedImageFolder', savePath, ...
         'savedSamples', savedSamples, ...
-        'misclassifiedSamples', bestResult.misclassifiedSamples, ...
-        'failedSamples', failedSamples, ...
-        'searchResults', searchResults);
-end
-
-function tbl = emptyMisclassifiedTable()
-    tbl = table(strings(0, 1), strings(0, 1), strings(0, 1), strings(0, 1), strings(0, 1), ...
-        'VariableNames', {'FileName', 'TrueLabel', 'PredictedLabel', 'OriginalPath', 'PreprocessedPath'});
+        'failedSamples', failedSamples);
 end
 
 function deletedCount = clearSavedPhotoFiles(folderPath, photoExts)
